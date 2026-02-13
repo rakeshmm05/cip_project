@@ -3,7 +3,7 @@ import pandas as pd
 from collections import defaultdict
 
 # ==========================================================
-# 1. GLOBAL CONFIGURATION (REPRODUCIBLE)
+# 1. GLOBAL CONFIGURATION 
 # ==========================================================
 
 SEED = 42
