@@ -1,10 +1,9 @@
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-from datetime import timedelta
+from collections import defaultdict, deque
 
 # ==========================================================
-# 1. GLOBAL CONFIGURATION (REPRODUCIBLE)
+# 1. GLOBAL CONFIGURATION
 # ==========================================================
 
 SEED = 42
@@ -27,63 +26,61 @@ PERSISTENCE_THRESHOLD = 4
 # ==========================================================
 
 rogue_targets = {
-    rx: np.random.choice(range(1, NUM_UES + 1),
-                         TARGET_UES_PER_ROGUE,
-                         replace=False)
+    rx: set(np.random.choice(range(1, NUM_UES + 1),
+                             TARGET_UES_PER_ROGUE,
+                             replace=False))
     for rx in ROGUE_XAPPS
 }
 
 # ==========================================================
-# 3. PHYSICS-CONSISTENT RADIO MODEL
+# 3. RADIO MODEL
 # ==========================================================
 
 def generate_radio_state(cell_load):
-
     rsrp = np.random.normal(-90, 6)
     interference = np.clip(np.random.normal(8 + 0.05 * cell_load, 2), 0, 30)
     sinr = np.clip(20 - interference + np.random.normal(0, 2), -5, 30)
 
-    bandwidth = 20
-    throughput = bandwidth * np.log2(1 + max(sinr, 0))
-
+    throughput = 20 * np.log2(1 + max(sinr, 0))
     latency = np.clip(40 - 0.8 * sinr + 0.4 * cell_load, 5, 200)
-
     packet_loss = np.clip(0.01 * interference + np.random.normal(0, 0.01), 0, 0.2)
 
     return rsrp, sinr, interference, throughput, latency, packet_loss
+
 
 def expected_policy(rsrp, sinr, cell_load):
     if rsrp < -105 or sinr < 5:
         return "power_increase"
     elif cell_load > 85:
         return "handover"
-    else:
-        return "no_action"
+    return "no_action"
 
 # ==========================================================
-# 4. DATA GENERATION
+# 4. DATA GENERATION (OPTIMIZED)
 # ==========================================================
 
 records = []
 
+# Faster structures
 xapp_last_time = {}
-xapp_action_history = defaultdict(list)
-target_history = defaultdict(list)
-degradation_history = defaultdict(list)
+xapp_action_history = defaultdict(lambda: deque())
+target_history = defaultdict(lambda: deque())
+degradation_history = defaultdict(lambda: deque(maxlen=PERSISTENCE_WINDOW))
 
-timestamps = pd.date_range(
-    start="2026-01-01",
-    periods=TOTAL_EVENTS,
-    freq=f"{TIME_STEP_MS}ms"
-)
+# Track unique targets per xapp efficiently
+xapp_unique_targets = defaultdict(set)
 
-for idx, ts in enumerate(timestamps):
+current_time = 0  # milliseconds
 
-    xapp_id = f"xapp_{np.random.randint(0, NUM_XAPPS)}"
+for idx in range(TOTAL_EVENTS):
+
+    current_time += TIME_STEP_MS
+
+    xapp_id = f"xapp_{np.random.randint(NUM_XAPPS)}"
     ue_id = np.random.randint(1, NUM_UES + 1)
     cell_id = np.random.randint(1, NUM_CELLS + 1)
-    neighbor_cell_count = np.random.randint(2, 6)
 
+    neighbor_cell_count = np.random.randint(2, 6)
     ue_mobility_speed = np.random.uniform(0, 80)
     ue_session_duration = np.random.uniform(0, 600)
 
@@ -96,7 +93,7 @@ for idx, ts in enumerate(timestamps):
 
     expected_action = expected_policy(rsrp, sinr, cell_load)
 
-    # Rogue behavior injection (structured, persistent)
+    # Rogue behavior
     if xapp_id in ROGUE_XAPPS and ue_id in rogue_targets[xapp_id]:
         action_type = "handover"
     else:
@@ -110,27 +107,23 @@ for idx, ts in enumerate(timestamps):
     resource_block_delta = np.random.randint(-5, 6)
 
     # ------------------------------------------------------
-    # Temporal Features
+    # Temporal features (FAST sliding window)
     # ------------------------------------------------------
 
-    time_delta_prev = (
-        (ts - xapp_last_time[xapp_id]).total_seconds()
-        if xapp_id in xapp_last_time else 0
-    )
+    time_delta_prev = current_time - xapp_last_time.get(xapp_id, current_time)
+    xapp_last_time[xapp_id] = current_time
 
-    xapp_last_time[xapp_id] = ts
+    history = xapp_action_history[xapp_id]
+    history.append(current_time)
 
-    xapp_action_history[xapp_id].append(ts)
-    window_actions = [
-        t for t in xapp_action_history[xapp_id]
-        if (ts - t).total_seconds() < 5
-    ]
+    while history and current_time - history[0] > 5000:
+        history.popleft()
 
-    xapp_action_rate = len(window_actions) / 5.0
-    message_frequency = len(window_actions)
+    message_frequency = len(history)
+    xapp_action_rate = message_frequency / 5.0
 
     # ------------------------------------------------------
-    # Context Consistency
+    # Context consistency
     # ------------------------------------------------------
 
     action_context_match = int(action_type == expected_action)
@@ -145,29 +138,25 @@ for idx, ts in enumerate(timestamps):
         performance_delta = 2
 
     # ------------------------------------------------------
-    # Relational Features
+    # Relational features (FAST)
     # ------------------------------------------------------
 
     key = (xapp_id, ue_id)
 
-    target_history[key].append(ts)
-    repeat_target_count = len([
-        t for t in target_history[key]
-        if (ts - t).total_seconds() < 5
-    ])
+    th = target_history[key]
+    th.append(current_time)
 
-    unique_targets = set([
-        u for (x, u) in target_history.keys() if x == xapp_id
-    ])
+    while th and current_time - th[0] > 5000:
+        th.popleft()
 
-    unique_target_ratio = len(unique_targets) / max(1, message_frequency)
+    repeat_target_count = len(th)
 
-    degradation_history[key].append(degradation_flag)
+    xapp_unique_targets[xapp_id].add(ue_id)
+    unique_target_ratio = len(xapp_unique_targets[xapp_id]) / max(1, message_frequency)
 
-    if len(degradation_history[key]) > PERSISTENCE_WINDOW:
-        degradation_history[key].pop(0)
-
-    rolling_degradation_count = sum(degradation_history[key])
+    dh = degradation_history[key]
+    dh.append(degradation_flag)
+    rolling_degradation_count = sum(dh)
 
     persistent_target_flag = int(
         rolling_degradation_count >= PERSISTENCE_THRESHOLD
@@ -181,10 +170,8 @@ for idx, ts in enumerate(timestamps):
 
     is_malicious = persistent_target_flag
 
-    flow_id = f"{xapp_id}_{ue_id}_{idx}"
-
     records.append([
-        ts,
+        current_time,
         time_delta_prev,
         xapp_id,
         xapp_action_rate,
@@ -214,7 +201,7 @@ for idx, ts in enumerate(timestamps):
         message_frequency,
         repeat_target_count,
         unique_target_ratio,
-        flow_id,
+        f"{xapp_id}_{ue_id}_{idx}",
         rolling_degradation_count,
         persistent_target_flag,
         context_violation_score,
@@ -222,7 +209,7 @@ for idx, ts in enumerate(timestamps):
     ])
 
 # ==========================================================
-# 5. EXPORT DATASET
+# 5. EXPORT
 # ==========================================================
 
 columns = [
@@ -264,7 +251,7 @@ columns = [
 ]
 
 df = pd.DataFrame(records, columns=columns)
-df.to_csv("dataset.csv", index=False)
+df.to_csv("imbalanced_dataset.csv", index=False)
 
 print("Dataset generated successfully.")
 print("Total samples:", len(df))
